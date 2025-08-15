@@ -25,3 +25,11 @@ Generate faceless vertical videos/shorts from a topic or a text script:
 Outputs to `out/` with timestamped name.
 
 ## Environment (.env)
+
+## Notes
+- Add an MP3 to `assets/music/` for background music (optional).
+- Place any fonts in `assets/fonts/` and point `--font` to a .ttf if you like.
+- This is an MVP. Swap in your preferred TTS (e.g., ElevenLabs, Amazon Polly), add Whisper for perfect subtitles, and wire up uploaders (YouTube/TikTok) as you grow it.
+
+## License
+MIT
