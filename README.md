@@ -26,6 +26,30 @@ Outputs to `out/` with timestamped name.
 
 ## Environment (.env)
 
+ ## Features
+ - 9:16 vertical video (1080x1920)
+ - TTS via gTTS (pluggable)
+ - Pexels stock B‑roll or local fallback
+ - Title overlay and music ducking
++ - Subtitles: sidecar SRT, optional hard burn‑in (ffmpeg)
+
+ ## Usage
+ - Generate from topic:  
+   `python faceless_maker.py make --topic "5 tips to sleep better" --length 60`
+ - Use your own script:  
+   `python faceless_maker.py make --script-file script.txt`
+ - Force local B‑roll only:  
+   `python faceless_maker.py make --topic "Space facts" --no-pexels`
++ - With subtitles:
++   - Sidecar SRT (default): `python faceless_maker.py make --topic "Space facts" --subs srt`
++   - Burn subtitles into video: `python faceless_maker.py make --topic "Space facts" --subs burn`
++   - Keep both: `python faceless_maker.py make --topic "Space facts" --subs both`
++
++### Subtitles notes
++- Uses faster-whisper; the model downloads on first run (set `WHISPER_MODEL` in `.env`).
++- Burning requires ffmpeg built with libass (most standard builds include it).
++- Language hint uses `DEFAULT_LANG` (e.g., `en`, `es`). We normalize `en-US` → `en`.
+
 ## Notes
 - Add an MP3 to `assets/music/` for background music (optional).
 - Place any fonts in `assets/fonts/` and point `--font` to a .ttf if you like.
