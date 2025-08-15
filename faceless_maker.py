@@ -1,21 +1,21 @@
 import os
 import re
 import math
-import json
 import time
 import argparse
 import random
 import textwrap
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union, Callable
 
 from dotenv import load_dotenv
 import requests
+import numpy as np
 
 # MoviePy
 from moviepy.editor import (
-    VideoFileClip, AudioFileClip, ImageClip,
+    VideoFileClip, AudioFileClip, ImageClip, VideoClip,
     concatenate_videoclips, CompositeVideoClip,
     CompositeAudioClip, ColorClip, vfx, afx
 )
@@ -25,6 +25,11 @@ from gtts import gTTS
 
 # Imaging for text overlays
 from PIL import Image, ImageDraw, ImageFont
+
+# Audio gen
+from pydub import AudioSegment
+from pydub.generators import Sine, WhiteNoise
+from pydub.effects import low_pass_filter
 
 # Whisper (optional; used for subtitles)
 try:
@@ -133,7 +138,6 @@ def pexels_search_videos(query: str, per_page=10, api_key: Optional[str]=None) -
     return r.json().get("videos", [])
 
 def best_video_file(video: dict) -> Optional[dict]:
-    # Choose a file near or above 1080p height, fallback to highest
     files = sorted(video.get("video_files", []), key=lambda f: f.get("height", 0), reverse=True)
     if not files:
         return None
@@ -182,43 +186,221 @@ def local_broll_paths() -> List[Path]:
     return sorted((ASSETS / "broll").glob("*.mp4"))
 
 # -----------------------------------------------------------------------------
+# Auto assets: font + music + procedural b-roll
+# -----------------------------------------------------------------------------
+def ensure_auto_font() -> Optional[Path]:
+    fonts = sorted((ASSETS / "fonts").glob("*.ttf"))
+    if fonts:
+        return fonts[0]
+    # Try to download a good open font
+    choices = [
+        ("Inter-SemiBold.ttf", "https://github.com/google/fonts/raw/main/ofl/inter/Inter-SemiBold.ttf"),
+        ("Montserrat-SemiBold.ttf", "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-SemiBold.ttf"),
+        ("Roboto-Bold.ttf", "https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Bold.ttf"),
+    ]
+    for name, url in choices:
+        try:
+            dst = ASSETS / "fonts" / f"Auto_{name}"
+            info(f"Fetching font: {name}")
+            download_url(url, dst)
+            return dst
+        except Exception as e:
+            warn(f"Font download failed for {name}: {e}")
+    warn("No TTF font available; will use PIL default.")
+    return None
+
+def pick_font_fallback() -> Optional[Path]:
+    fonts = sorted((ASSETS / "fonts").glob("*.ttf"))
+    if fonts:
+        return fonts[0]
+    return ensure_auto_font()
+
+def hz(note: int) -> float:
+    # MIDI note -> Hz
+    return 440.0 * (2 ** ((note - 69) / 12.0))
+
+def build_chord(root_midi: int, quality: str = "maj", duration_ms: int = 4000, gain_each_db: float = -18.0) -> AudioSegment:
+    # Simple triad: root, third, fifth
+    third = 4 if quality == "maj" else 3
+    fifth = 7
+    freqs = [hz(root_midi), hz(root_midi + third), hz(root_midi + fifth)]
+    seg = AudioSegment.silent(duration=duration_ms)
+    for f in freqs:
+        seg = seg.overlay(Sine(f).to_audio_segment(duration=duration_ms).apply_gain(gain_each_db))
+    # gentle fade at segment edges
+    seg = seg.fade_in(200).fade_out(200)
+    return seg
+
+def ensure_auto_music(min_seconds: int = 18) -> Optional[Path]:
+    # If music exists, keep it
+    existing = sorted((ASSETS / "music").glob("*.mp3"))
+    if existing:
+        return existing[0]
+    try:
+        info("Auto-generating background music...")
+        tempo = random.randint(72, 92)  # BPM
+        beat_ms = int(60000 / tempo)
+        bar_ms = beat_ms * 4
+        # pick a key
+        roots = {"C":60, "D":62, "E":64, "F":65, "G":67, "A":69, "B":71}
+        key = random.choice(list(roots.keys()))
+        major = random.random() < 0.65
+        root_midi = roots[key] + (random.choice([0,12]))  # octave 4 or 5
+        # simple progression
+        degrees = [0, 5, 9 if major else 8, 7]  # I - V - vi/VI - IV
+        prog = [root_midi + d for d in degrees]
+        segs = []
+        for p in prog:
+            segs.append(build_chord(p, "maj" if major else "min", duration_ms=bar_ms*2, gain_each_db=-20))
+        music = sum(segs)
+        # add soft bass drone
+        bass = Sine(hz(root_midi-24)).to_audio_segment(duration=len(music)).apply_gain(-24).fade_in(500).fade_out(500)
+        music = music.overlay(bass)
+        # subtle noise texture
+        noise = WhiteNoise().to_audio_segment(duration=len(music)).apply_gain(-36)
+        noise = low_pass_filter(noise, 2000)
+        music = music.overlay(noise)
+        # normalize-ish for a bed
+        target_dbfs = -20.0
+        change = target_dbfs - music.dBFS
+        music = music.apply_gain(change)
+        out = ASSETS / "music" / "autogen_lofi.mp3"
+        music.export(out, format="mp3")
+        info(f"Generated music: {out}")
+        return out
+    except Exception as e:
+        warn(f"Music autogen failed: {e}")
+        return None
+
+def seeded_random(text: str) -> random.Random:
+    return random.Random(abs(hash(text)) % (2**32))
+
+def palette_from_text(text: str) -> List[tuple]:
+    rnd = seeded_random(text)
+    # Generate 3-4 pleasing colors
+    base_h = rnd.random()
+    def hsl_to_rgb(h, s, l):
+        import colorsys
+        r, g, b = colorsys.hls_to_rgb(h % 1.0, l, s)
+        return int(r*255), int(g*255), int(b*255)
+    cols = [
+        hsl_to_rgb(base_h, 0.5 + 0.2*rnd.random(), 0.35 + 0.2*rnd.random()),
+        hsl_to_rgb(base_h + 0.12, 0.5 + 0.2*rnd.random(), 0.45 + 0.1*rnd.random()),
+        hsl_to_rgb(base_h + 0.24, 0.5 + 0.2*rnd.random(), 0.55 + 0.1*rnd.random()),
+        hsl_to_rgb(base_h + 0.36, 0.4 + 0.2*rnd.random(), 0.30 + 0.2*rnd.random())
+    ]
+    return cols
+
+def gradient_image(w: int, h: int, c1: tuple, c2: tuple, diagonal: bool = True) -> np.ndarray:
+    # Simple linear gradient between two colors
+    if diagonal:
+        x = np.linspace(0, 1, w)[None, :]
+        y = np.linspace(0, 1, h)[:, None]
+        t = (x + y) / 2.0
+    else:
+        t = np.tile(np.linspace(0, 1, w)[None, :], (h, 1))
+    c1 = np.array(c1).reshape(1,1,3).astype(np.float32)
+    c2 = np.array(c2).reshape(1,1,3).astype(np.float32)
+    t3 = t[..., None]
+    img = (1 - t3) * c1 + t3 * c2
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+def shapes_overlay(img: Image.Image, palette: List[tuple], rnd: random.Random, n: int = 6) -> Image.Image:
+    draw = ImageDraw.Draw(img, "RGBA")
+    w, h = img.size
+    for _ in range(n):
+        c = random.choice(palette)
+        alpha = rnd.randint(40, 110)
+        x1 = rnd.randint(0, w-1)
+        y1 = rnd.randint(0, h-1)
+        x2 = rnd.randint(x1, min(w, x1 + rnd.randint(w//8, w//3)))
+        y2 = rnd.randint(y1, min(h, y1 + rnd.randint(h//10, h//3)))
+        if rnd.random() < 0.5:
+            draw.ellipse([x1, y1, x2, y2], fill=(c[0], c[1], c[2], alpha))
+        else:
+            draw.rectangle([x1, y1, x2, y2], fill=(c[0], c[1], c[2], alpha))
+    return img
+
+def make_proc_image(topic_text: str, w: int = TARGET_W, h: int = TARGET_H) -> np.ndarray:
+    rnd = seeded_random(topic_text + str(random.random()))
+    pal = palette_from_text(topic_text)
+    base = gradient_image(w, h, pal[0], pal[1], diagonal=True)
+    img = Image.fromarray(base)
+    img = shapes_overlay(img, pal, rnd, n=rnd.randint(4, 8))
+    # add subtle grain
+    arr = np.array(img).astype(np.float32)
+    noise = (np.random.randn(h, w, 1) * 2.0).astype(np.float32)
+    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+    return arr
+
+def ken_burns_from_image(img_np: np.ndarray, duration: float) -> VideoClip:
+    # Create a gentle zoom + slight pan from a static image
+    base = ImageClip(img_np).set_duration(duration)
+    # Up-scale a bit and crop pan
+    zoom = 1.06
+    base = base.resize(lambda t: 1.0 + (zoom - 1.0) * (t / max(0.001, duration)))
+    # Add a very subtle left-right pan by cropping a slightly bigger frame
+    W, H = base.w, base.h
+    if W < TARGET_W or H < TARGET_H:
+        base = base.resize(height=TARGET_H)
+    W, H = base.w, base.h
+    pan_px = int(max(12, W * 0.01))
+    x_start = (W // 2) - pan_px
+    x_end = (W // 2) + pan_px
+    def x_center(t):
+        return x_start + (x_end - x_start) * (t / max(0.001, duration))
+    kb = vfx.crop(base, width=TARGET_W, height=TARGET_H, x_center=x_center, y_center=H/2)
+    return kb
+
+def generate_procedural_broll_clips(topic_text: str, want: int = 8) -> List[VideoClip]:
+    info(f"Generating procedural b-roll (no assets/API)...")
+    clips = []
+    for i in range(want):
+        dur = random.uniform(3.0, 5.0)
+        img = make_proc_image(topic_text + f"_{i}", TARGET_W, TARGET_H)
+        clip = ken_burns_from_image(img, duration=dur)
+        # subtle saturation tweak: overlay with transparent color or leave as is
+        clips.append(clip)
+    return clips
+
+# -----------------------------------------------------------------------------
 # Visuals and composition
 # -----------------------------------------------------------------------------
-def ensure_vertical(clip: VideoFileClip) -> VideoFileClip:
+def ensure_vertical(clip: VideoClip) -> VideoClip:
     # Resize and center-crop to 1080x1920
-    # Step 1: resize height to TARGET_H
     clip = clip.resize(height=TARGET_H)
-    # Step 2: crop width to TARGET_W (centered) if wider, else pad
     if clip.w >= TARGET_W:
         x_center = clip.w / 2
         clip = clip.crop(x_center=x_center, y_center=clip.h/2, width=TARGET_W, height=TARGET_H)
     else:
-        # pad left/right
-        pad_w = (TARGET_W - clip.w) // 2
         bg = ColorClip(size=(TARGET_W, TARGET_H), color=(0, 0, 0)).set_duration(clip.duration)
         clip = CompositeVideoClip([bg, clip.set_position(("center", "center"))]).set_duration(clip.duration)
     return clip
 
-def assemble_broll(video_paths: List[Path], target_duration: float) -> VideoFileClip:
-    if not video_paths:
-        raise RuntimeError("No b-roll videos available. Add files to assets/broll or set PEXELS_API_KEY.")
-    # Load clips
-    raw = [VideoFileClip(str(p)).without_audio() for p in video_paths]
-    # Build a sequence of small segments until we cover target duration
+def assemble_broll(sources: List[Union[Path, str, VideoClip]], target_duration: float) -> VideoClip:
+    if not sources:
+        raise RuntimeError("No b-roll sources provided.")
+    # Normalize sources into clips
+    raw: List[VideoClip] = []
+    for s in sources:
+        if isinstance(s, (str, Path)):
+            raw.append(VideoFileClip(str(s)).without_audio())
+        else:
+            raw.append(s)
     segments = []
     remaining = target_duration
     i = 0
-    while remaining > 0 and i < 400:  # safety
+    while remaining > 0 and i < 400:
         src = raw[i % len(raw)]
         seg_len = max(2.0, min(4.5, remaining))
-        if src.duration <= seg_len + 0.2:
+        if getattr(src, "duration", 0) <= seg_len + 0.2:
             sub = src
         else:
             start = random.uniform(0, max(0, src.duration - seg_len))
             sub = src.subclip(start, start + seg_len)
         sub = ensure_vertical(sub)
-        # mild motion (zoom/pan)
-        if random.random() < 0.7:
+        # mild motion (zoom/pan) for videos only (ImageClips already have)
+        if not isinstance(sub, ImageClip) and random.random() < 0.7:
             z = random.uniform(1.02, 1.08)
             sub = sub.fx(vfx.resize, newsize=(int(sub.w*z), int(sub.h*z))).fx(
                 vfx.crop, width=TARGET_W, height=TARGET_H, x_center=sub.w*z/2, y_center=sub.h*z/2
@@ -227,7 +409,6 @@ def assemble_broll(video_paths: List[Path], target_duration: float) -> VideoFile
         remaining -= sub.duration
         i += 1
     seq = concatenate_videoclips(segments, method="compose")
-    # Darken slightly for readability
     overlay = ColorClip((TARGET_W, TARGET_H), color=(0, 0, 0)).set_opacity(0.12).set_duration(seq.duration)
     seq = CompositeVideoClip([seq, overlay]).set_duration(seq.duration)
     return seq
@@ -237,7 +418,6 @@ def text_image_clip(text: str, width: int, font_path: Optional[Path], font_size:
     for para in text.split("\n"):
         lines.extend(textwrap.wrap(para, width=32))
     font = ImageFont.truetype(str(font_path), font_size) if font_path and font_path.exists() else ImageFont.load_default()
-    # measure
     tmp = Image.new("RGBA", (width, 10), (0,0,0,0))
     draw = ImageDraw.Draw(tmp)
     w = 0
@@ -251,10 +431,7 @@ def text_image_clip(text: str, width: int, font_path: Optional[Path], font_size:
         line_heights.append(lh)
     w = min(width, w + padding*2)
     h = h + padding*2
-    if bg is None:
-        img = Image.new("RGBA", (w, h), (0,0,0,0))
-    else:
-        img = Image.new("RGBA", (w, h), bg)
+    img = Image.new("RGBA", (w, h), (0,0,0,0) if bg is None else bg)
     draw = ImageDraw.Draw(img)
     y = padding
     for idx, line in enumerate(lines):
@@ -264,16 +441,17 @@ def text_image_clip(text: str, width: int, font_path: Optional[Path], font_size:
         draw.text((x, y), line, font=font, fill=color, stroke_width=stroke, stroke_fill=stroke_color)
         y += line_heights[idx] + 8
     frame = Image.new("RGB", (TARGET_W, TARGET_H), (0,0,0))
-    # place near top
     fx = (TARGET_W - w)//2
     fy = int(TARGET_H*0.08)
     frame.paste(img, (fx, fy), img)
-    return ImageClip(frame).set_duration(duration)
+    return ImageClip(np.array(frame)).set_duration(duration)
 
 # -----------------------------------------------------------------------------
 # Audio helpers
 # -----------------------------------------------------------------------------
 def pick_music() -> Optional[Path]:
+    # Ensure at least one music bed exists
+    ensure_auto_music(min_seconds=20)
     choices = sorted((ASSETS / "music").glob("*.mp3"))
     return random.choice(choices) if choices else None
 
@@ -317,7 +495,6 @@ def transcribe_with_whisper(audio_path: Path, lang: Optional[str]) -> Optional[L
     return out
 
 def rough_subs_from_text(text: str, total_duration: float) -> List[dict]:
-    # Fallback: split by sentences and apportion time by character count
     sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
     if not sents:
         sents = [text.strip()]
@@ -334,7 +511,6 @@ def rough_subs_from_text(text: str, total_duration: float) -> List[dict]:
         t = end
         if t >= total_duration:
             break
-    # Merge too-short trailing segments
     merged = []
     for seg in segments:
         if merged and (seg["end"] - seg["start"]) < 0.7:
@@ -373,7 +549,6 @@ def write_srt(segments: List[dict], out_path: Path, total_duration: Optional[flo
     info(f"Wrote subtitles: {out_path}")
 
 def _escape_for_ffmpeg_subtitles(p: Path) -> str:
-    # ffmpeg subtitles filter needs escaped backslashes and colons
     s = str(Path(p).resolve())
     s = s.replace("\\", "\\\\").replace(":", r"\:")
     return s
@@ -391,7 +566,13 @@ def burn_subtitles_ffmpeg(in_video: Path, srt_path: Path, out_video: Path, font_
     ])
     style = ",".join(style_parts)
     sub_arg = f"subtitles={_escape_for_ffmpeg_subtitles(srt_path)}:force_style={style}"
-    cmd = ["ffmpeg", "-y", "-i", str(in_video), "-vf", sub_arg, "-c:a", "copy", str(out_video)]
+    cmd = [
+        "ffmpeg", "-y", "-i", str(in_video),
+        "-vf", sub_arg,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        str(out_video)
+    ]
     info(f"Burning subtitles with ffmpeg → {out_video}")
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -403,7 +584,6 @@ def create_subtitles(voice_mp3: Path, srt_out: Path, lang: str, fallback_text: s
     segments = transcribe_with_whisper(voice_mp3, lang)
     if not segments:
         segments = rough_subs_from_text(fallback_text, total_duration)
-    # Clean up stray whitespace and ensure monotonic times
     cleaned = []
     last_end = 0.0
     for seg in segments:
@@ -417,6 +597,22 @@ def create_subtitles(voice_mp3: Path, srt_out: Path, lang: str, fallback_text: s
 # -----------------------------------------------------------------------------
 # Pipeline
 # -----------------------------------------------------------------------------
+def extract_keywords(text: str) -> List[str]:
+    words = [w.lower() for w in re.findall(r"[a-zA-Z]{4,}", text)]
+    common = set("this that with from your have will into they them then when what were been being over into more only very just make like much many time tips ways best good".split())
+    freq = {}
+    for w in words:
+        if w in common:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+    keys = [w for w,_ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)]
+    if not keys:
+        keys = ["abstract", "background", "city", "nature", "technology"]
+    base = keys[:6]
+    filler = ["abstract", "bokeh", "city night", "clouds", "nature", "office", "technology", "patterns", "gradient"]
+    base.extend(random.sample(filler, k=min(6, len(filler))))
+    return base[:10]
+
 def make_video(topic: Optional[str],
                script_text: Optional[str],
                length_hint: Optional[int],
@@ -444,22 +640,24 @@ def make_video(topic: Optional[str],
     voice = AudioFileClip(str(voice_mp3))
     target_duration = voice.duration
 
-    # 3) B‑roll
+    # 3) B‑roll sources (Pexels → local → procedural)
     keywords = extract_keywords(title + " " + body)
     api_key = os.getenv("PEXELS_API_KEY")
-    video_paths = []
+    sources: List[Union[Path, VideoClip]] = []
     if use_pexels and api_key:
-        video_paths = fetch_broll_from_pexels(keywords, api_key, want=8)
-    if not video_paths:
+        paths = fetch_broll_from_pexels(keywords, api_key, want=8)
+        sources.extend(paths)
+    if not sources:
         local = local_broll_paths()
         if local:
             info(f"Using {len(local)} local b‑roll file(s)")
-            video_paths = local
-        else:
-            raise RuntimeError("No b‑roll available. Either add files to assets/broll or set PEXELS_API_KEY and omit --no-pexels.")
+            sources.extend(local)
+    if not sources:
+        # Procedural generation
+        sources.extend(generate_procedural_broll_clips(" ".join(keywords), want=8))
 
     # 4) Visual assembly
-    seq = assemble_broll(video_paths, target_duration)
+    seq = assemble_broll(sources, target_duration)
     # 5) Title overlay (first 2–3 seconds)
     font_path = Path(font) if font else pick_font_fallback()
     title_clip = text_image_clip(title, width=int(TARGET_W*0.9), font_path=font_path, font_size=64, duration=min(3.0, seq.duration))
@@ -491,10 +689,8 @@ def make_video(topic: Optional[str],
             create_subtitles(voice_mp3, srt_path, lang, full_narration, target_duration)
             if subs_mode in ("burn", "both"):
                 burned = out_path.with_name(out_path.stem + "_subbed" + out_path.suffix)
-                # Pass font name only (ffmpeg subtitles filter relies on system fonts)
                 font_name = None
                 if font:
-                    # If user gave a font path, try to use its stem as font name
                     font_name = Path(font).stem
                 burn_subtitles_ffmpeg(out_path, srt_path, burned, font_name=font_name, font_size=42, margin_v=80)
                 info("Done.")
@@ -503,28 +699,6 @@ def make_video(topic: Optional[str],
             warn(f"Subtitles generation failed: {e}")
     info("Done.")
     return out_path
-
-def extract_keywords(text: str) -> List[str]:
-    words = [w.lower() for w in re.findall(r"[a-zA-Z]{4,}", text)]
-    common = set("this that with from your have will into they them then when what were been being over into more only very just make like much many time tips ways best good".split())
-    freq = {}
-    for w in words:
-        if w in common:
-            continue
-        freq[w] = freq.get(w, 0) + 1
-    keys = [w for w,_ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)]
-    if not keys:
-        keys = ["abstract", "background", "city", "nature", "technology"]
-    # diversify
-    base = keys[:6]
-    filler = ["abstract", "bokeh", "city night", "clouds", "nature", "office", "technology", "patterns", "gradient"]
-    base.extend(random.sample(filler, k=min(6, len(filler))))
-    return base[:10]
-
-def pick_font_fallback() -> Optional[Path]:
-    # Try a commonly available font (adjust path per OS if desired)
-    candidates = list((ASSETS / "fonts").glob("*.ttf"))
-    return candidates[0] if candidates else None
 
 # -----------------------------------------------------------------------------
 # CLI
@@ -538,7 +712,7 @@ def main():
     mk.add_argument("--topic", type=str, help="Topic to generate script")
     mk.add_argument("--script-file", type=str, help="Path to a text file to read script from")
     mk.add_argument("--length", type=int, default=60, help="Target length in seconds (hint)")
-    mk.add_argument("--no-pexels", action="store_true", help="Disable Pexels and use local assets only")
+    mk.add_argument("--no-pexels", action="store_true", help="Disable Pexels and use local/procedural assets")
     mk.add_argument("--lang", type=str, default=os.getenv("DEFAULT_LANG", "en"), help="gTTS language code, e.g., en")
     mk.add_argument("--font", type=str, default=None, help="Path to a .ttf font for title")
     mk.add_argument("--subs", type=str, choices=["none","srt","burn","both"], default="srt", help="Generate subtitles: srt (default), burn (hard), both, or none")
