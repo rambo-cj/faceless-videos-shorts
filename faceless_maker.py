@@ -6,6 +6,7 @@ import time
 import argparse
 import random
 import textwrap
+import subprocess
 from pathlib import Path
 from typing import List, Optional
 
@@ -24,6 +25,13 @@ from gtts import gTTS
 
 # Imaging for text overlays
 from PIL import Image, ImageDraw, ImageFont
+
+# Whisper (optional; used for subtitles)
+try:
+    from faster_whisper import WhisperModel
+    HAS_WHISPER = True
+except Exception:
+    HAS_WHISPER = False
 
 # -----------------------------------------------------------------------------
 # Paths and constants
@@ -212,7 +220,9 @@ def assemble_broll(video_paths: List[Path], target_duration: float) -> VideoFile
         # mild motion (zoom/pan)
         if random.random() < 0.7:
             z = random.uniform(1.02, 1.08)
-            sub = sub.fx(vfx.resize, newsize=(int(sub.w*z), int(sub.h*z))).fx(vfx.crop, width=TARGET_W, height=TARGET_H, x_center=sub.w*z/2, y_center=sub.h*z/2)
+            sub = sub.fx(vfx.resize, newsize=(int(sub.w*z), int(sub.h*z))).fx(
+                vfx.crop, width=TARGET_W, height=TARGET_H, x_center=sub.w*z/2, y_center=sub.h*z/2
+            )
         segments.append(sub)
         remaining -= sub.duration
         i += 1
@@ -276,6 +286,135 @@ def build_audio(voice_mp3: Path, music_path: Optional[Path]) -> AudioFileClip:
     return CompositeAudioClip(tracks).set_duration(voice.duration)
 
 # -----------------------------------------------------------------------------
+# Subtitles (Whisper + SRT + optional burn-in via ffmpeg)
+# -----------------------------------------------------------------------------
+def normalize_lang(lang: Optional[str]) -> Optional[str]:
+    if not lang:
+        return None
+    lang = lang.lower().strip()
+    for sep in ("-", "_"):
+        if sep in lang:
+            return lang.split(sep)[0]
+    return lang[:2] if len(lang) > 2 else lang
+
+def transcribe_with_whisper(audio_path: Path, lang: Optional[str]) -> Optional[List[dict]]:
+    if not HAS_WHISPER:
+        warn("faster-whisper not installed; using rough subtitles fallback.")
+        return None
+    model_name = os.getenv("WHISPER_MODEL", "small")
+    device = os.getenv("WHISPER_DEVICE", "cpu")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", None)
+    if compute_type is None:
+        compute_type = "int8" if device == "cpu" else "float16"
+    info(f"Transcribing with whisper model '{model_name}' on {device} ({compute_type})...")
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    segments, _ = model.transcribe(str(audio_path), language=normalize_lang(lang), vad_filter=True, beam_size=1)
+    out = []
+    for seg in segments:
+        out.append({"start": float(seg.start), "end": float(seg.end), "text": seg.text.strip()})
+    if not out:
+        return None
+    return out
+
+def rough_subs_from_text(text: str, total_duration: float) -> List[dict]:
+    # Fallback: split by sentences and apportion time by character count
+    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
+    if not sents:
+        sents = [text.strip()]
+    counts = [max(1, len(s)) for s in sents]
+    total_chars = sum(counts)
+    segments = []
+    t = 0.0
+    for i, s in enumerate(sents):
+        frac = counts[i] / total_chars
+        dur = max(1.2, total_duration * frac)
+        start = t
+        end = total_duration if i == len(sents) - 1 else min(total_duration, t + dur)
+        segments.append({"start": float(start), "end": float(end), "text": s})
+        t = end
+        if t >= total_duration:
+            break
+    # Merge too-short trailing segments
+    merged = []
+    for seg in segments:
+        if merged and (seg["end"] - seg["start"]) < 0.7:
+            merged[-1]["end"] = seg["end"]
+            merged[-1]["text"] += " " + seg["text"]
+        else:
+            merged.append(seg)
+    return merged
+
+def _srt_ts(t: float) -> str:
+    if t < 0: t = 0.0
+    ms = int(round((t - math.floor(t)) * 1000))
+    s = int(t) % 60
+    m = (int(t) // 60) % 60
+    h = int(t) // 3600
+    if ms == 1000:
+        ms = 0
+        s += 1
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+def write_srt(segments: List[dict], out_path: Path, total_duration: Optional[float] = None):
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        start = max(0.0, float(seg["start"]))
+        end = float(seg["end"])
+        if total_duration is not None:
+            end = min(end, total_duration)
+        if end <= start:
+            end = start + 0.5
+        text = seg["text"].strip()
+        lines.append(str(i))
+        lines.append(f"{_srt_ts(start)} --> {_srt_ts(end)}")
+        lines.append(text)
+        lines.append("")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    info(f"Wrote subtitles: {out_path}")
+
+def _escape_for_ffmpeg_subtitles(p: Path) -> str:
+    # ffmpeg subtitles filter needs escaped backslashes and colons
+    s = str(Path(p).resolve())
+    s = s.replace("\\", "\\\\").replace(":", r"\:")
+    return s
+
+def burn_subtitles_ffmpeg(in_video: Path, srt_path: Path, out_video: Path, font_name: Optional[str] = None, font_size: int = 42, margin_v: int = 80):
+    style_parts = []
+    if font_name:
+        style_parts.append(f"FontName={font_name}")
+    style_parts.extend([
+        f"FontSize={font_size}",
+        "BorderStyle=3",
+        "Outline=2",
+        "Shadow=0",
+        f"MarginV={margin_v}"
+    ])
+    style = ",".join(style_parts)
+    sub_arg = f"subtitles={_escape_for_ffmpeg_subtitles(srt_path)}:force_style={style}"
+    cmd = ["ffmpeg", "-y", "-i", str(in_video), "-vf", sub_arg, "-c:a", "copy", str(out_video)]
+    info(f"Burning subtitles with ffmpeg → {out_video}")
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        warn("ffmpeg burn-in failed; keeping sidecar SRT only.")
+        warn(e.stderr.decode(errors="ignore")[:800])
+
+def create_subtitles(voice_mp3: Path, srt_out: Path, lang: str, fallback_text: str, total_duration: float):
+    segments = transcribe_with_whisper(voice_mp3, lang)
+    if not segments:
+        segments = rough_subs_from_text(fallback_text, total_duration)
+    # Clean up stray whitespace and ensure monotonic times
+    cleaned = []
+    last_end = 0.0
+    for seg in segments:
+        start = max(last_end, float(seg["start"]))
+        end = max(start + 0.3, float(seg["end"]))
+        cleaned.append({"start": start, "end": end, "text": seg["text"].strip()})
+        last_end = end
+    write_srt(cleaned, srt_out, total_duration=total_duration)
+    return cleaned
+
+# -----------------------------------------------------------------------------
 # Pipeline
 # -----------------------------------------------------------------------------
 def make_video(topic: Optional[str],
@@ -283,7 +422,8 @@ def make_video(topic: Optional[str],
                length_hint: Optional[int],
                use_pexels: bool,
                lang: str,
-               font: Optional[str]) -> Path:
+               font: Optional[str],
+               subs_mode: str = "srt") -> Path:
     # 1) Script
     if script_text:
         lines = [l.strip() for l in script_text.strip().splitlines() if l.strip()]
@@ -343,6 +483,24 @@ def make_video(topic: Optional[str],
         bitrate="5M",
         threads=4
     )
+
+    # 8) Subtitles (SRT + optional burn)
+    if subs_mode in ("srt", "burn", "both"):
+        srt_path = out_path.with_suffix(".srt")
+        try:
+            create_subtitles(voice_mp3, srt_path, lang, full_narration, target_duration)
+            if subs_mode in ("burn", "both"):
+                burned = out_path.with_name(out_path.stem + "_subbed" + out_path.suffix)
+                # Pass font name only (ffmpeg subtitles filter relies on system fonts)
+                font_name = None
+                if font:
+                    # If user gave a font path, try to use its stem as font name
+                    font_name = Path(font).stem
+                burn_subtitles_ffmpeg(out_path, srt_path, burned, font_name=font_name, font_size=42, margin_v=80)
+                info("Done.")
+                return burned if subs_mode == "burn" else out_path
+        except Exception as e:
+            warn(f"Subtitles generation failed: {e}")
     info("Done.")
     return out_path
 
@@ -383,6 +541,7 @@ def main():
     mk.add_argument("--no-pexels", action="store_true", help="Disable Pexels and use local assets only")
     mk.add_argument("--lang", type=str, default=os.getenv("DEFAULT_LANG", "en"), help="gTTS language code, e.g., en")
     mk.add_argument("--font", type=str, default=None, help="Path to a .ttf font for title")
+    mk.add_argument("--subs", type=str, choices=["none","srt","burn","both"], default="srt", help="Generate subtitles: srt (default), burn (hard), both, or none")
 
     args = parser.parse_args()
     if args.cmd == "make":
@@ -395,7 +554,7 @@ def main():
                 raise SystemExit(2)
             script_text = p.read_text(encoding="utf-8")
         try:
-            make_video(topic, script_text, args.length, use_pexels=not args.no_pexels, lang=args.lang, font=args.font)
+            make_video(topic, script_text, args.length, use_pexels=not args.no_pexels, lang=args.lang, font=args.font, subs_mode=args.subs)
         except Exception as e:
             err(str(e))
             raise SystemExit(1)
