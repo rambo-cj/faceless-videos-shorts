@@ -1,54 +1,25 @@
 # Faceless Video Studio (MVP)
 
 Generate faceless vertical videos/shorts from a topic or a text script:
-- Script → TTS → B‑roll (Pexels/local) → Music → 9:16 render.
+- Script → TTS → B‑roll (Pexels/local) → Music → 9:16 render → Subtitles (SRT or burned in)
 
 ## Features
-- 9:16 vertical video (1080x1920)
+- 9:16 vertical video (1080x1920) with light motion and readability overlay
 - TTS via gTTS (pluggable)
-- Pexels stock B‑roll or local fallback
-- Title overlay and music ducking
+- Pexels stock B‑roll (optional) or local fallback
+- Title overlay and background music with ducking
+- Subtitles: sidecar SRT and optional hard burn‑in (ffmpeg)
 
 ## Setup
-1) Install FFmpeg and Python 3.10+
-2) `pip install -r requirements.txt`
-3) Copy `.env.example` → `.env`, set any keys (optional but recommended)
-
-## Usage
-- Generate from topic:  
-  `python faceless_maker.py make --topic "5 tips to sleep better" --length 60`
-- Use your own script:  
-  `python faceless_maker.py make --script-file script.txt`
-- Force local B‑roll only:  
-  `python faceless_maker.py make --topic "Space facts" --no-pexels`
-
-Outputs to `out/` with timestamped name.
+1) Install FFmpeg (make sure your build includes `libass` for subtitle burn‑in).
+   - macOS: `brew install ffmpeg`
+   - Windows: `choco install ffmpeg`
+   - Linux (Debian/Ubuntu): `sudo apt-get install ffmpeg`
+2) Python 3.10+ recommended.
+3) Install deps: `pip install -r requirements.txt`
+4) Copy `.env.example` → `.env` and set any keys (optional but recommended).
 
 ## Environment (.env)
-
- ## Features
- - 9:16 vertical video (1080x1920)
- - TTS via gTTS (pluggable)
- - Pexels stock B‑roll or local fallback
- - Title overlay and music ducking
-+ - Subtitles: sidecar SRT, optional hard burn‑in (ffmpeg)
-
- ## Usage
- - Generate from topic:  
-   `python faceless_maker.py make --topic "5 tips to sleep better" --length 60`
- - Use your own script:  
-   `python faceless_maker.py make --script-file script.txt`
- - Force local B‑roll only:  
-   `python faceless_maker.py make --topic "Space facts" --no-pexels`
-+ - With subtitles:
-+   - Sidecar SRT (default): `python faceless_maker.py make --topic "Space facts" --subs srt`
-+   - Burn subtitles into video: `python faceless_maker.py make --topic "Space facts" --subs burn`
-+   - Keep both: `python faceless_maker.py make --topic "Space facts" --subs both`
-+
-+### Subtitles notes
-+- Uses faster-whisper; the model downloads on first run (set `WHISPER_MODEL` in `.env`).
-+- Burning requires ffmpeg built with libass (most standard builds include it).
-+- Language hint uses `DEFAULT_LANG` (e.g., `en`, `es`). We normalize `en-US` → `en`.
 
 ## Notes
 - Add an MP3 to `assets/music/` for background music (optional).
