@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sets up a Python venv, installs requirements, checks/installs FFmpeg,
-# and creates a .env from .env.example if missing.
+# Sets up a Python venv, installs requirements (incl. numpy, faster-whisper),
+# checks/installs FFmpeg, verifies subtitles filter, and creates .env if missing.
 
 set -euo pipefail
 
@@ -39,12 +39,30 @@ fi
 echo "==> Upgrading pip/setuptools/wheel"
 "$PYV" -m pip install --upgrade pip setuptools wheel
 
-echo "==> Installing Python requirements"
+echo "==> Installing Python requirements (this may take a minute)"
 "$PYV" -m pip install -r requirements.txt
+
+# Apple Silicon: libomp helps faster-whisper CPU performance and avoids runtime errors
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if have brew; then
+    if ! brew list --versions libomp >/dev/null 2>&1; then
+      echo "==> Installing libomp (OpenMP runtime) via Homebrew..."
+      brew install libomp || true
+    fi
+  else
+    echo "[!] Homebrew not found. If you see 'libomp' errors later, install it: https://brew.sh then 'brew install libomp'"
+  fi
+fi
 
 echo "==> Checking FFmpeg"
 if have ffmpeg; then
-  echo "FFmpeg found: $(ffmpeg -version | head -n1)"
+  echo "FFmpeg: $(ffmpeg -version | head -n1)"
+  # Check subtitles filter presence (libass)
+  if ffmpeg -hide_banner -filters 2>/dev/null | grep -q "\<subtitles\>"; then
+    echo "[i] FFmpeg subtitles filter available."
+  else
+    echo "[!] FFmpeg 'subtitles' filter not found. Burn-in may fail. Reinstall FFmpeg with libass support."
+  fi
 else
   echo "FFmpeg not found."
   if [[ "${NO_FFMPEG_INSTALL:-0}" == "1" ]]; then
@@ -87,10 +105,10 @@ if [[ ! -f ".env" && -f ".env.example" ]]; then
   echo "==> Created .env from .env.example"
 fi
 
-# Quick import test (optional)
-echo "==> Verifying imports"
+# Quick import test (optional but useful)
+echo "==> Verifying Python imports"
 "$PYV" - <<'PY'
-mods = ["moviepy", "gtts", "PIL", "requests"]
+mods = ["moviepy", "gtts", "PIL", "requests", "pydub", "numpy"]
 failed = []
 for m in mods:
     try:
